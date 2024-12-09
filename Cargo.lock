@@ -2733,6 +2733,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "log",
  "rayon",
  "rfd",
  "tracing",

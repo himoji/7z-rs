@@ -12,7 +12,7 @@ impl Default for ArchiveZone {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Password(pub Option<String>);
 
 impl Password {

@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
+use tracing::info;
 use zip::write::FileOptions;
-use crate::app::CompressionStats;
+use crate::app::{ArchiveManager, CompressionStats};
 
 const BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
 const COMPRESSION_LEVEL: i32 = 5; // Faster compression, still decent ratio
@@ -16,6 +17,7 @@ pub fn compress_files_parallel(
     progress_tx: Sender<(f32, CompressionStats)>,
     cancel_rx: Arc<Mutex<Sender<()>>>,
     stats: Arc<Mutex<CompressionStats>>,
+    password: String
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_size: u64 = files.iter()
         .filter_map(|path| std::fs::metadata(path).ok())
@@ -56,10 +58,18 @@ pub fn compress_files_parallel(
                 .to_string_lossy()
                 .into_owned();
 
-            let options: FileOptions<'_, ()> = FileOptions::default()
+            let mut options: FileOptions<'_, ()> = FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .compression_level(Some(COMPRESSION_LEVEL as i64))
                 .unix_permissions(0o755);
+
+            info!("Password enc: {:?}", password.as_str());
+
+            if !password.is_empty() {
+                options = options
+                    .with_aes_encryption(zip::AesMode::Aes256, password.as_str());
+            }
+
 
             // Minimize lock contention by reducing the critical section
             {

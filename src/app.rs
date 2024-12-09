@@ -1,17 +1,19 @@
+use crate::models::{ArchiveFile, ArchiveZone, Password};
+use crate::parallel::compress_files_parallel;
+use crate::utils::{get_formatted_size, get_temp_dir, open_system_file};
+use eframe::epaint::Color32;
+use egui::{Label, RichText, Sense};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, Duration};
-use eframe::epaint::Color32;
-use egui::{Label, RichText, Sense};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use zip::{ZipArchive};
-use crate::models::{ArchiveFile, ArchiveZone, Password};
-use crate::parallel::compress_files_parallel;
-use crate::utils::{open_system_file, get_temp_dir, get_formatted_size};
+use zip::result::ZipError;
+use zip::write::FileOptions;
+use zip::ZipArchive;
 
 #[derive(Clone, Default)]
 pub struct ProgressState {
@@ -54,8 +56,14 @@ impl Default for ArchiveManager {
             status_message: String::new(),
             show_settings: false,
             current_archive: None,
-            compress_zone: ArchiveZone { is_compress_zone: true, ..Default::default() },
-            extract_zone: ArchiveZone { is_compress_zone: false, ..Default::default() },
+            compress_zone: ArchiveZone {
+                is_compress_zone: true,
+                ..Default::default()
+            },
+            extract_zone: ArchiveZone {
+                is_compress_zone: false,
+                ..Default::default()
+            },
             last_used_password: None,
             compression_sender: None,
             hover_file: None,
@@ -81,11 +89,11 @@ impl ArchiveManager {
             let (cancel_tx, _cancel_rx) = channel();
             let cancel_tx = Arc::new(Mutex::new(cancel_tx));
             let progress_state = Arc::clone(&self.progress_state);
-            let total_size: u64 = files.iter()
+            let total_size: u64 = files
+                .iter()
                 .filter_map(|path| std::fs::metadata(path).ok())
                 .map(|meta| meta.len())
                 .sum();
-
 
             let stats = CompressionStats {
                 original_size: total_size,
@@ -96,12 +104,20 @@ impl ArchiveManager {
             };
             let stats = Arc::new(Mutex::new(stats));
 
+            let password = self.password.0.clone().unwrap();
+
             // Store sender for cancellation
             self.compression_sender = Some(cancel_tx.lock().unwrap().clone());
-
             // Spawn compression thread
             thread::spawn(move || {
-                if let Err(e) = compress_files_parallel(files, output_path, progress_tx, cancel_tx, stats) {
+                if let Err(e) = compress_files_parallel(
+                    files,
+                    output_path,
+                    progress_tx,
+                    cancel_tx,
+                    stats,
+                    password,
+                ) {
                     error!("Compression error: {}", e);
                 }
             });
@@ -144,7 +160,9 @@ impl ArchiveManager {
                 let mut processed_size = 0;
 
                 while let Ok(n) = zip_file.read(&mut buffer) {
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     temp_file.write_all(&buffer[..n]).unwrap();
                     processed_size += n as u64;
 
@@ -167,18 +185,33 @@ impl ArchiveManager {
         let file = File::open(path)?;
         let mut archive = ZipArchive::new(file)?;
 
-        let needs_password = archive.by_index(0)
-            .map(|f| f.encrypted())
-            .unwrap_or(false);
+        let needs_password = archive
+            .get_aes_verification_key_and_salt(0)
+            .unwrap()
+            .is_none()
+            == false;
 
         if needs_password && self.password.0.is_none() {
-            if let Some(last_pwd) = &self.last_used_password {
-                self.password.set(last_pwd.clone());
-            } else {
-                self.status_message = "Archive is encrypted. Please enter password in settings.".to_string();
+                self.status_message =
+                    "Archive is encrypted. Please enter password in settings.".to_string();
                 self.show_settings = true;
                 return Ok(());
+
+        }
+
+        if self.password.0.is_some() {
+            let mut files = Vec::new();
+            for i in 0..archive.len() {
+                let file = archive.by_index_decrypt(i, self.password.0.clone().unwrap().as_bytes())?;
+                files.push(ArchiveFile {
+                    name: file.name().to_string(),
+                    is_directory: file.is_dir(),
+                    size: file.size(),
+                });
             }
+            self.current_archive = Some((path.to_path_buf(), files));
+            self.status_message = "Archive opened successfully".to_string();
+            return Ok(())
         }
 
         let mut files = Vec::new();
@@ -190,14 +223,10 @@ impl ArchiveManager {
                 size: file.size(),
             });
         }
-
-        if needs_password {
-            self.last_used_password = self.password.0.clone();
-        }
-
         self.current_archive = Some((path.to_path_buf(), files));
         self.status_message = "Archive opened successfully".to_string();
         Ok(())
+
     }
 
     pub fn cleanup_removed_files(&mut self) {
@@ -209,7 +238,6 @@ impl ArchiveManager {
         }
         self.files_to_remove.clear();
     }
-
 
     fn handle_drops(&mut self, ctx: &egui::Context) {
         // Store the zones at the start of the frame
@@ -228,7 +256,7 @@ impl ArchiveManager {
                     (Some(pos), Some(rect)) => {
                         info!("Checking drop zone - pointer: {:?}, zone: {:?}", pos, rect);
                         rect.contains(pos)
-                    },
+                    }
                     _ => {
                         warn!("Could not determine drop zone - using default (compress zone)");
                         true
@@ -256,12 +284,14 @@ impl ArchiveManager {
             }
         });
     }
-    pub fn handle_file_drop(&mut self, path: &Path, dropped_in_compress_zone: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn handle_file_drop(
+        &mut self,
+        path: &Path,
+        dropped_in_compress_zone: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Handling file drop: {:?}", path);
 
-        let extension = path.extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("");
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
 
         info!("File extension: {}", extension);
 
@@ -270,16 +300,17 @@ impl ArchiveManager {
                 info!("Adding archive to compression list");
                 self.selected_files.push(path.to_path_buf());
                 self.status_message = "Archive added to compression list".to_string();
-            },
+            }
             ("zip" | "7z" | "rar", false) => {
                 info!("Opening archive for viewing");
+
                 self.open_archive(path)?;
-            },
+            }
             _ if dropped_in_compress_zone => {
                 info!("Adding regular file to compression list");
                 self.selected_files.push(path.to_path_buf());
                 self.status_message = "File added to compression list".to_string();
-            },
+            }
             _ => {
                 warn!("Unsupported file type for viewing");
                 self.status_message = "Unsupported file type for viewing".to_string();
@@ -292,7 +323,7 @@ impl ArchiveManager {
 impl eframe::App for ArchiveManager {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if ctx.input(|i| i.pointer.is_moving()) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(1000/144));
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000 / 60));
         }
 
         if self.dark_mode {
@@ -331,27 +362,36 @@ impl eframe::App for ArchiveManager {
                         &mut password_str,
                         false,
                         &mut Default::default(),
-                        (&mut |new_password| self.password.set(new_password))
+                        (&mut |new_password| self.password.set(new_password)),
                     );
                 });
             } else {
                 // Compression zone at the top
                 ui.group(|ui| {
+
                     ui.heading("Files to Compress");
-                    let compress_response = ui.add(
-                        egui::Label::new("Drop files here to add to compression list")
-                            .sense(egui::Sense::hover())
+                    let compress_response = ui.allocate_ui_with_layout(
+                        egui::Vec2::new(200.0, 100.0), // Width and height of the area
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown), // Center text
+                        |ui| {
+                            ui.add(egui::Label::new("Drop files here to add to compression list")
+                                .sense(egui::Sense::hover()));
+                        },
                     );
-                    self.compress_zone.rect = Some(compress_response.rect);
+
+                    self.compress_zone.rect = Some(compress_response.response.rect);
 
                     // Scrollable area for file list
                     egui::ScrollArea::vertical()
                         .id_salt("filestocompress")
                         .max_height(200.0) // Fixed height for scroll area
                         .show(ui, |ui| {
-                            crate::ui::draw_file_list(ui, &self.selected_files, &mut self.files_to_remove);
-                        })
-                        ;
+                            crate::ui::draw_file_list(
+                                ui,
+                                &self.selected_files,
+                                &mut self.files_to_remove,
+                            );
+                        });
 
                     // Show compression progress in the compression zone
                     if let Ok(state) = self.progress_state.lock() {
@@ -379,11 +419,17 @@ impl eframe::App for ArchiveManager {
                 // Archive viewing zone
                 ui.group(|ui| {
                     ui.heading("Archive Contents");
-                    let extract_response = ui.add(
-                        egui::Label::new("Drop archive here to view contents")
-                            .sense(egui::Sense::hover())
+
+                    let extract_response = ui.allocate_ui_with_layout(
+                        egui::Vec2::new(200.0, 100.0), // Width and height of the area
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown), // Center text
+                        |ui| {
+                            ui.add(egui::Label::new("Drop archive here to view contents")
+                                .sense(egui::Sense::hover()));
+                        },
                     );
-                    self.extract_zone.rect = Some(extract_response.rect);
+
+                    self.extract_zone.rect = Some(extract_response.response.rect);
 
                     // Scrollable area for archive contents
                     egui::ScrollArea::vertical()
@@ -408,20 +454,21 @@ impl eframe::App for ArchiveManager {
 
                                         if !file.is_directory {
                                             let response = ui.add(
-                                                Label::new(
-                                                    RichText::new(&text)
-                                                        .color(if Some(file.name.clone()) == hover_file {
-                                                            Color32::YELLOW
-                                                        } else {
-                                                            ui.style().visuals.text_color()
-                                                        })
-                                                )
-                                                    .sense(Sense::click())
+                                                Label::new(RichText::new(&text).color(
+                                                    if Some(file.name.clone()) == hover_file {
+                                                        Color32::YELLOW
+                                                    } else {
+                                                        ui.style().visuals.text_color()
+                                                    },
+                                                ))
+                                                .sense(Sense::click()),
                                             );
 
                                             if response.hovered() {
                                                 new_hover = Some(file.name.clone());
-                                                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                                                ui.output_mut(|o| {
+                                                    o.cursor_icon = egui::CursorIcon::PointingHand
+                                                });
                                             }
 
                                             if response.double_clicked() {
@@ -443,7 +490,9 @@ impl eframe::App for ArchiveManager {
 
                                 // Handle any errors from opening files
                                 if let Some(e) = open_result {
-                                    ui.label(RichText::new(format!("Error: {}", e)).color(Color32::RED));
+                                    ui.label(
+                                        RichText::new(format!("Error: {}", e)).color(Color32::RED),
+                                    );
                                 }
                             }
                         });
@@ -467,12 +516,15 @@ impl eframe::App for ArchiveManager {
 
             // Status message area at the bottom
             if !self.status_message.is_empty() {
-                ui.label(egui::RichText::new(&self.status_message)
-                    .color(if self.status_message.starts_with("Error") {
-                        egui::Color32::RED
-                    } else {
-                        ui.style().visuals.text_color()
-                    }));
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new(&self.status_message).color(
+                        if self.status_message.starts_with("Error") {
+                            egui::Color32::RED
+                        } else {
+                            ui.style().visuals.text_color()
+                        },
+                    ));
+                });
             }
         });
 
