@@ -25,6 +25,7 @@ impl Password {
     }
 }
 
+#[derive(Clone)]
 pub struct ArchiveFile {
     pub name: String,
     pub is_directory: bool,
